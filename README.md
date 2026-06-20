@@ -146,3 +146,10 @@ curl -X POST "http://localhost:8000/predict" -F "file=@/path/to/test.jpg" --outp
 ## Заключение
 
 Проект показал, что при аккуратной подготовке данных и использовании предобученного бэкбона можно получить стабильную модель с **~0.91 accuracy** и **F1 ≈ 0.88** для распознавания камней. Для повышения практической надёжности на реальных фотографиях рекомендую улучшить постобработку, усилить аугментации и рассмотреть переход к детекторной архитектуре при необходимости точной локализации.
+
+## Результаты
+<img width="1140" height="931" alt="image" src="https://github.com/user-attachments/assets/998fd0fa-156c-474f-8a50-e332643cc4ee" />
+<img width="1140" height="931" alt="image" src="https://github.com/user-attachments/assets/9c5dc6e2-ae13-4d2a-b470-7dc61cdf78b5" />
+<img width="1140" height="931" alt="image" src="https://github.com/user-attachments/assets/3f793e6b-b6a1-4d93-9da2-285b3170bb7f" />
+
+
