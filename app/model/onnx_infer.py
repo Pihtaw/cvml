@@ -8,7 +8,7 @@ import onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 
-# --- preprocessing constants (подберите под вашу модель) ---
+# --- preprocessing constants ---
 IMG = 64
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
