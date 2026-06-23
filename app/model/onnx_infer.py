@@ -1,173 +1,118 @@
 # app/model/onnx_infer.py
-import os
-import logging
-from typing import Tuple, List, Dict
+import onnxruntime as ort
 import numpy as np
 from PIL import Image
-import onnxruntime as ort
+import math
+import json
+from typing import List, Tuple
 
-logger = logging.getLogger(__name__)
+def run_onnx_detector(sess: ort.InferenceSession, img_pil: Image.Image, input_name: str, img_size: int = 640):
+    """
+    Выполняет инференс детектора на одном PIL изображении.
+    Возвращает raw output (list of numpy arrays) из sess.run.
+    """
+    im = img_pil.convert('RGB').resize((img_size, img_size))
+    arr = np.array(im).astype(np.float32) / 255.0
+    # yolov5 export expects NCHW
+    inp = np.transpose(arr, (2,0,1))[None,:,:,:].astype(np.float32)
+    outputs = sess.run(None, {input_name: inp})
+    return outputs
 
-# --- preprocessing constants ---
-IMG = 64
-MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
 
-# ----------------- init session -----------------
-def init_session(onnx_path: str = "/app/app/model/model.onnx", providers=None) -> Tuple[ort.InferenceSession, str, object]:
-    if providers is None:
-        providers = ["CPUExecutionProvider"]
-    if not os.path.exists(onnx_path):
-        raise FileNotFoundError(f"ONNX model not found at {onnx_path}")
-    sess_options = ort.SessionOptions()
-    sess_options.intra_op_num_threads = 1
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(onnx_path, sess_options, providers=providers)
-    inp = sess.get_inputs()[0]
-    logger.info("ONNX loaded: %s", onnx_path)
-    logger.info("ONNX input name=%s shape=%s type=%s", inp.name, inp.shape, inp.type)
-    return sess, inp.name, inp.shape
+def decode_yolov5_output(output, img_size=640, conf_thres=0.25):
+    """
+    Декодирует выход ONNX от yolov5 export.
+    Ожидается формат [1, N, 5+num_classes] или [N, 85].
+    Возвращает списки: boxes (x1,y1,x2,y2 в пикселях), scores, class_ids
+    """
+    # поддержка разных форматов
+    if isinstance(output, list):
+        out = output[0]
+    else:
+        out = output
+    preds = np.array(out)
+    if preds.ndim == 3:
+        preds = preds[0]
+    xywh = preds[:, :4]
+    obj = preds[:, 4:5]
+    cls_probs = preds[:, 5:]
+    # если cls_probs суммарно >1, вероятно уже softmaxed; используем argmax
+    class_ids = np.argmax(cls_probs, axis=1)
+    class_scores = cls_probs[np.arange(len(class_ids)), class_ids]
+    scores = (obj[:,0] * class_scores).astype(np.float32)
+    # фильтр по порогу
+    keep = scores > conf_thres
+    if keep.sum() == 0:
+        return np.zeros((0,4)), np.array([]), np.array([], dtype=int)
+    xywh = xywh[keep]
+    scores = scores[keep]
+    class_ids = class_ids[keep]
+    # Если xywh в нормализованных координатах (0..1), умножим на img_size
+    # Определим по величинам: если max(xywh) <= 1.01 — нормализовано
+    if xywh.max() <= 1.01:
+        xywh = xywh * img_size
+    cx = xywh[:,0]; cy = xywh[:,1]; w = xywh[:,2]; h = xywh[:,3]
+    x1 = cx - w/2; y1 = cy - h/2; x2 = cx + w/2; y2 = cy + h/2
+    boxes = np.stack([x1,y1,x2,y2], axis=1)
+    return boxes, scores, class_ids
 
-# ----------------- preprocessing -----------------
-def preprocess_pil_image(img_pil: Image.Image, img_size: int = IMG) -> np.ndarray:
-    img = img_pil.convert("RGB").resize((img_size, img_size))
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    arr = (arr - MEAN[None, None, :]) / STD[None, None, :]
-    arr = arr.transpose(2, 0, 1)  # CHW
-    return arr.astype(np.float32)
+def nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.45):
+    """
+    Простая NMS на numpy. boxes: [N,4] x1,y1,x2,y2
+    Возвращает индексы оставшихся боксов.
+    """
+    if boxes.shape[0] == 0:
+        return np.array([], dtype=int)
+    x1 = boxes[:,0]; y1 = boxes[:,1]; x2 = boxes[:,2]; y2 = boxes[:,3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return np.array(keep, dtype=int)
 
-# ----------------- safe runner -----------------
-def run_onnx_safe(sess: ort.InferenceSession, input_name: str, batch_array: np.ndarray, chunk_size: int = 32) -> np.ndarray:
-    N = batch_array.shape[0]
-    model_shape = sess.get_inputs()[0].shape
-    first_dim = model_shape[0]
-    outputs = []
-    # model fixed batch == 1
-    if isinstance(first_dim, int) and first_dim == 1:
-        for i in range(N):
-            single = batch_array[i:i+1]
-            out = sess.run(None, {input_name: single})
-            outputs.append(out[0])
-        return np.vstack(outputs)
-    # dynamic batch supported -> chunking
-    for i in range(0, N, chunk_size):
-        chunk = batch_array[i:i+chunk_size]
-        out = sess.run(None, {input_name: chunk})
-        outputs.append(out[0])
-    return np.vstack(outputs)
+def detections_from_onnx_output(outputs, img_size=640, conf_thres=0.25, iou_thres=0.45):
+    """
+    Полный pipeline: decode -> NMS -> вернуть финальные боксы, scores, classes
+    """
+    boxes, scores, class_ids = decode_yolov5_output(outputs, img_size=img_size, conf_thres=conf_thres)
+    if boxes.shape[0] == 0:
+        return [], [], []
+    keep = nms_numpy(boxes, scores, iou_threshold=iou_thres)
+    final_boxes = boxes[keep]
+    final_scores = scores[keep]
+    final_classes = class_ids[keep]
+    return final_boxes, final_scores, final_classes
 
-# ----------------- inference helpers -----------------
-def infer_pil_list(sess: ort.InferenceSession, input_name: str, pil_images: List[Image.Image], chunk_size: int = 32) -> np.ndarray:
-    arrs = [preprocess_pil_image(im, IMG) for im in pil_images]
-    batch = np.stack(arrs, axis=0)
-    logits = run_onnx_safe(sess, input_name, batch, chunk_size=chunk_size)
-    # softmax
-    exp = np.exp(logits - np.max(logits, axis=1, keepdims=True))
-    probs = exp / np.sum(exp, axis=1, keepdims=True)
-    return probs
-
-def infer_full_image_pil(img_pil: Image.Image, sess: ort.InferenceSession, input_name: str,
-                         grid_n: int = 19, patch_size: int = IMG, chunk_size: int = 32):
-    W, H = img_pil.size
-    step_x = W / grid_n; step_y = H / grid_n
-    patches = []
-    coords = []
-    for gy in range(grid_n):
-        for gx in range(grid_n):
-            x1 = int(round(gx * step_x)); y1 = int(round(gy * step_y))
-            x2 = int(round(min(W, (gx+1) * step_x))); y2 = int(round(min(H, (gy+1) * step_y)))
-            patch = img_pil.crop((x1, y1, x2, y2)).resize((patch_size, patch_size))
-            patches.append(patch)
-            coords.append((x1, y1, x2, y2))
-    probs = infer_pil_list(sess, input_name, patches, chunk_size=chunk_size)
-    return probs, coords
-
-# ----------------- postprocess -----------------
-def postprocess_grid(probs: np.ndarray,
-                     coords: List[tuple],
-                     class_names: List[str] = ["empty", "black", "white"],
-                     threshold: float = 0.5,
-                     skip_empty: bool = True) -> Dict:
-    out = {"cells": [], "grid_shape": None}
-    if probs is None or len(probs) == 0:
-        return out
-    N, C = probs.shape
-    use_coords = coords if coords and len(coords) == N else [None] * N
-    for i in range(N):
-        p = probs[i]
-        label = int(np.argmax(p))
-        prob = float(p[label])
-        # пропускаем пустые, если включён флаг
-        if skip_empty and label == 0:
-            continue
-        label_name = class_names[label] if label < len(class_names) else str(label)
-        bbox = use_coords[i]
-        cell = {"bbox": bbox, "label": label, "label_name": label_name, "prob": prob}
-        if prob < threshold:
-            cell["low_confidence"] = True
-        out["cells"].append(cell)
-    sq = int(np.round(np.sqrt(N)))
-    if sq * sq == N:
-        out["grid_shape"] = (sq, sq)
-    return out
-
-
-# ----------------- drawing helpers (совместимо с разными Pillow) -----------------
-from PIL import ImageDraw, ImageFont
-import io
-
-def _measure_text(draw: ImageDraw.ImageDraw, text: str, font):
-    try:
-        if font is not None and hasattr(font, "getsize"):
-            return font.getsize(text)
-        if hasattr(draw, "textbbox"):
-            bbox = draw.textbbox((0, 0), text, font=font)
-            w = bbox[2] - bbox[0]
-            h = bbox[3] - bbox[1]
-            return (w, h)
-        if hasattr(draw, "textsize"):
-            return draw.textsize(text, font=font)
-    except Exception:
-        pass
-    return (len(text) * 6, 11)
-
-def draw_boxes_on_image(pil_img: Image.Image, cells: list, show_label=True, threshold=0.2) -> Image.Image:
-    img = pil_img.convert("RGB")
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
-
-    colors = {0: (200, 200, 200), 1: (255, 0, 0), 2: (0, 255, 0)}
-
-    for cell in cells:
-        bbox = cell.get("bbox")
-        if not bbox:
-            continue
-        prob = float(cell.get("prob", 0.0))
-        label = int(cell.get("label", 0))
-        name = cell.get("label_name", str(label))
-
-        if prob < threshold:
-            continue
-
-        x1, y1, x2, y2 = bbox
-        color = colors.get(label, (255, 0, 0))
-
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-
-        if show_label:
-            text = f"{name} {prob:.2f}"
-            tw, th = _measure_text(draw, text, font)
-            tx1, ty1 = x1, max(0, y1 - th - 6)
-            tx2, ty2 = x1 + tw + 6, ty1 + th + 4
-            draw.rectangle([tx1, ty1, tx2, ty2], fill=(0, 0, 0))
-            draw.text((tx1 + 3, ty1 + 2), text, fill=(255, 255, 255), font=font)
-
-    return img
-
-def pil_image_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    return buf.getvalue()
+def bboxs_to_grid(boxes: np.ndarray, image_size: Tuple[int,int], grid_n: int = 19):
+    """
+    Преобразует список bbox (x1,y1,x2,y2) в карту grid_n x grid_n.
+    Возвращает grid (grid_n,grid_n) с метками 0/1/2 и список назначений.
+    При конфликте выбирается bbox с наибольшим score (это нужно делать с scores).
+    """
+    W, H = image_size
+    grid = np.zeros((grid_n, grid_n), dtype=int)
+    assignments = []  # list of (gy,gx,cls,box)
+    if boxes is None or len(boxes)==0:
+        return grid, assignments
+    for b in boxes:
+        x1,y1,x2,y2 = b
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        gx = int(min(grid_n-1, math.floor(cx / (W / grid_n))))
+        gy = int(min(grid_n-1, math.floor(cy / (H / grid_n))))
+        assignments.append((gy, gx, b))
+    return grid, assignments
